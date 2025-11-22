@@ -46,21 +46,23 @@ tokenizer = None
 snac_model = None
 models_loaded = False
 
-def build_prompt(tokenizer, description: str, text: str) -> str:
-    """Build formatted prompt for Maya1."""
-    soh_token = tokenizer.decode([SOH_ID])
-    eoh_token = tokenizer.decode([EOH_ID])
-    soa_token = tokenizer.decode([SOA_ID])
-    sos_token = tokenizer.decode([CODE_START_TOKEN_ID])
-    eot_token = tokenizer.decode([TEXT_EOT_ID])
-    bos_token = tokenizer.bos_token
+def build_prompt(tokenizer, description: str, text: str):
+    """Build formatted prompt for Maya1 as token IDs."""
+    # Sanitize description: remove newlines, extra spaces, quotes, and angle brackets
+    # This prevents prompt leakage and malformed tags
+    description = " ".join(description.split())
+    description = description.replace('"', '').replace("'", "").replace("<", "").replace(">", "")
     
     formatted_text = f'<description="{description}"> {text}'
-    prompt = (
-        soh_token + bos_token + formatted_text + eot_token +
-        eoh_token + soa_token + sos_token
-    )
-    return prompt
+    
+    # Encode text to IDs without adding special tokens
+    text_ids = tokenizer.encode(formatted_text, add_special_tokens=False)
+    
+    # Construct the full sequence of IDs
+    # SOH, BOS, text..., EOT, EOH, SOA, SOS
+    input_ids = [SOH_ID, BOS_ID] + text_ids + [TEXT_EOT_ID, EOH_ID, SOA_ID, CODE_START_TOKEN_ID]
+    
+    return torch.tensor([input_ids], dtype=torch.long)
 
 def unpack_snac_from_7(snac_tokens: list) -> list:
     """Unpack 7-token SNAC frames to 3 hierarchical levels."""
@@ -146,20 +148,21 @@ def generate_speech(preset_name, description, text, temperature, max_tokens, see
         print(f"Generating with temperature={temperature}, max_tokens={max_tokens}, seed={seed}...")
         
         # Build prompt
-        prompt = build_prompt(tokenizer, description, text)
-        inputs = tokenizer(prompt, return_tensors="pt")
+        # Build prompt
+        input_ids = build_prompt(tokenizer, description, text)
         
         if torch.cuda.is_available():
-            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+            input_ids = input_ids.to("cuda")
         
         # Generate tokens
         with torch.inference_mode():
             outputs = model.generate(
-                **inputs, 
+                input_ids=input_ids, 
                 max_new_tokens=max_tokens,
                 min_new_tokens=28,
                 temperature=temperature, 
-                top_p=0.9, 
+                top_p=0.95,  # Increased from 0.9 for better quality
+                top_k=50,  # Added top_k to limit sampling to top 50 tokens
                 repetition_penalty=1.1,
                 do_sample=True,
                 eos_token_id=CODE_END_TOKEN_ID,
@@ -167,7 +170,7 @@ def generate_speech(preset_name, description, text, temperature, max_tokens, see
             )
         
         # Extract SNAC tokens
-        generated_ids = outputs[0, inputs['input_ids'].shape[1]:].tolist()
+        generated_ids = outputs[0, input_ids.shape[1]:].tolist()
         
         # Find EOS and extract SNAC codes
         eos_idx = generated_ids.index(CODE_END_TOKEN_ID) if CODE_END_TOKEN_ID in generated_ids else len(generated_ids)
@@ -175,6 +178,12 @@ def generate_speech(preset_name, description, text, temperature, max_tokens, see
         
         if len(snac_tokens) < 7:
             return None, "Error: Not enough tokens generated. Try different text or increase max_tokens."
+        
+        # Validate token count is divisible by 7 for proper frame alignment
+        valid_token_count = (len(snac_tokens) // 7) * 7
+        if valid_token_count < len(snac_tokens):
+            print(f"Warning: Trimming {len(snac_tokens) - valid_token_count} tokens for frame alignment")
+            snac_tokens = snac_tokens[:valid_token_count]
         
         # Unpack and decode
         levels = unpack_snac_from_7(snac_tokens)
@@ -263,10 +272,10 @@ with gr.Blocks(title="Maya1 - Open Source Emotional TTS", theme=gr.themes.Soft()
                 temperature_slider = gr.Slider(
                     minimum=0.1,
                     maximum=1.0,
-                    value=0.4,
-                    step=0.1,
+                    value=0.3,
+                    step=0.05,
                     label="Temperature",
-                    info="Lower = more stable, Higher = more creative"
+                    info="Lower = more stable/clear, Higher = more creative/varied (0.2-0.4 recommended)"
                 )
                 
                 max_tokens_slider = gr.Slider(
